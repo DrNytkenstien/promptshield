@@ -68,7 +68,7 @@ _Placeholder: numbers from the tiny starter seed set only. Replace with results 
 
 | path | what it is |
 |---|---|
-| `promptshield/` | the SDK: `preprocess.py`, `signals/`, `fuse.py`, `taint.py`, `gate.py`, `audit.py`, `shield.py` |
+| `promptshield/` | the SDK: `preprocess.py`, `media.py`, `signals/`, `fuse.py`, `taint.py`, `gate.py`, `audit.py`, `shield.py` |
 | `policies/email_agent.yaml` | which tools are risky and which arguments to taint-check |
 | `demo_agent/` | a mock email agent (no real email is ever sent), with a real-LLM or simulated brain |
 | `api/main.py` | FastAPI service |
@@ -82,7 +82,7 @@ _Placeholder: numbers from the tiny starter seed set only. Replace with results 
 ## Limitations (we know where the system stops)
 
 - Only inline CSS is understood; text hidden via `<style>` classes or external stylesheets counts as visible.
-- Images, PDFs-as-images and audio are not scanned (text only).
+- Image OCR and audio processing depend on optional system binaries (`tesseract` and `whisper`); missing binaries fall back gracefully to standard text and EXIF metadata extraction.
 - Detection can be evaded by a determined attacker. The action gate reduces the damage, but an action with no destination argument (e.g. "summarise wrongly") can't be taint-checked.
 - The taint check matches values (addresses, URLs, numbers) after undoing simple obfuscation. It can't follow data that the agent paraphrases.
 - Human approval can suffer from alert fatigue; we only ask for high-risk actions and show where the instruction came from.
@@ -95,7 +95,8 @@ We only attack our own mock agent and mock outbox. All addresses use the reserve
 ## Work done before vs during the event
 
 - **Before the event (22–28 Sep, mentoring week):** everything up to the git tag `v0.9-pre-event`. The initial scaffold was drafted with AI coding assistance and then reviewed, tested and extended by the team (see `data/LICENSES.md`).
-- **During the event (30 Sep – 1 Oct):** every commit after `v0.9-pre-event`. <!-- list the main items here at the end -->
+- **During the event (30 Sep – 1 Oct):** every commit after `v0.9-pre-event`.
+  - Added multi-modal media processing (`media.py`) for PDF extraction, EXIF metadata smuggling and Tesseract image OCR.
 
 ## Disclosure
 
