@@ -39,3 +39,17 @@ trusted_values:
 
 # A bulk action above this size is treated as needing approval when untrusted content is present.
 bulk_threshold: 5
+
+actions:
+  send_email:
+    taint_checkable: true
+    requires_approval: conditional
+  forward_email:
+    taint_checkable: true
+    requires_approval: conditional
+  summarize_inbox:
+    taint_checkable: false
+    requires_approval: conditional
+  draft_reply:
+    taint_checkable: false
+    requires_approval: conditional

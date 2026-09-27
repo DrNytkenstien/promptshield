@@ -13,12 +13,15 @@ Known limitation (say this to judges): we only understand INLINE styles. Text hi
 CSS classes defined in <style> blocks or external stylesheets is treated as visible.
 """
 from __future__ import annotations
+from promptshield.media import MediaProcessor
+from promptshield.media import MediaProcessor
 
 import base64
 import binascii
 import re
 import unicodedata
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from bs4 import BeautifulSoup, Comment
 
@@ -60,10 +63,25 @@ class Preprocessed:
 
 
 # ================================================================= public entry point
-def preprocess(content: str) -> Preprocessed:
-    """Clean `content` (HTML or plain text) and split it into scoreable chunks."""
+media_processor = MediaProcessor()
+def preprocess(content: str | bytes | Path, modality: str = "auto") -> Preprocessed:
+    """Clean `content` (HTML, plain text, or media files) and split it into scoreable chunks."""
     findings: list[Finding] = []
     hidden: list[str] = []
+
+    # 2. Add media extraction block here (before HTML parsing)
+    if isinstance(content, (bytes, Path)) or modality != "auto":
+        media_res = media_processor.process(content, modality=modality)
+        content = media_res["text"]
+        if media_res.get("metadata_text"):
+            hidden.append(media_res["metadata_text"])
+            findings.append(
+                Finding(
+                    kind="media_metadata",
+                    detail=f"Extracted EXIF/metadata from {media_res['modality']}",
+                    text=media_res["metadata_text"],
+                )
+            )
 
     if _looks_like_html(content):
         visible, html_hidden, html_findings = _split_html(content)

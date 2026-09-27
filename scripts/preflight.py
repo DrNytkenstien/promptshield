@@ -175,7 +175,10 @@ def check_scan_speed() -> None:
     r = s.scan(email["body"], source="preflight")
     ok = r.level == "quarantine"
     report("OK" if ok else "FAIL", "Demo attack e3 is quarantined", f"risk {r.risk}, {r.latency_ms} ms")
-    (ROOT / "runtime" / "preflight.db").unlink(missing_ok=True)
+    try:
+        (ROOT / "runtime" / "preflight.db").unlink(missing_ok=True)
+    except PermissionError:
+        pass
 
 
 def check_tests() -> None:

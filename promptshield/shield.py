@@ -21,6 +21,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+from promptshield.media import ingest_media
 from . import fuse
 from .audit import AuditLog
 from .config import POLICY_DIR
@@ -70,9 +71,14 @@ class Shield:
         self._sessions.pop(session_id, None)
 
     # ================================================================ checkpoint 1
-    def scan(self, content: str, source: str = "content", session_id: str = "default",
+    def scan(self, content: Any, source: str = "content", session_id: str = "default",
              label: str = "") -> ScanResult:
         t0 = time.perf_counter()
+
+        # Media Normalization: Extract text signals from Images, PDFs, and Audio
+        if source in ["image", "pdf", "audio"] or isinstance(content, (Path, bytes)):
+            content, source = ingest_media(content, media_type=source)
+
         pre = preprocess(content)
         chunks = pre.chunks
 
