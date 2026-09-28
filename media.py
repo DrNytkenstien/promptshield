@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import io
+import re
+import shutil
 from pathlib import Path
-from typing import Any, Tuple, Union
+from typing import Tuple, Union, Optional, Dict, Any, List
 
 try:
     import pymupdf as fitz
@@ -15,16 +17,30 @@ except ImportError:
         HAS_FITZ = False
 
 try:
-    from PIL import Image, ImageEnhance, ExifTags      # fixed: no "PIL" in this import
+    import PIL
+    from PIL import Image, ImageEnhance, ExifTags
     HAS_PIL = True
 except ImportError:
+    Image = None  # type: ignore
+    ImageEnhance = None  # type: ignore
+    ExifTags = None  # type: ignore
     HAS_PIL = False
 
 try:
     import pytesseract
+    # Check for common Windows installation paths if tesseract is not on PATH
+    tesseract_paths = [
+        r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+        r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+        str(Path.home() / "AppData" / "Local" / "Programs" / "Tesseract-OCR" / "tesseract.exe"),
+    ]
+    if not shutil.which("tesseract"):
+        for path in tesseract_paths:
+            if Path(path).exists():
+                pytesseract.pytesseract.tesseract_cmd = path
+                break
+
     HAS_TESSERACT = True
-    # Windows: uncomment if Tesseract isn't on PATH
-    # pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 except ImportError:
     HAS_TESSERACT = False
 
@@ -34,177 +50,424 @@ try:
 except ImportError:
     HAS_WHISPER = False
 
-_IMAGE_EXT = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp")
-_AUDIO_EXT = (".mp3", ".wav", ".m4a")
-_SKIP_INFO_KEYS = {"icc_profile", "exif", "dpi", "jfif", "jfif_version", "jfif_unit", "jfif_density"}
+# Graceful import for OpenCV
+try:
+    import cv2
+    import numpy as np
+    HAS_OPENCV = True
+except ImportError:
+    HAS_OPENCV = False
 
 
-def _sniff(content: Any) -> str | None:
-    """Work out what kind of media this is, including raw uploaded bytes."""
-    if isinstance(content, (bytes, bytearray)):
-        b = bytes(content)
-        if b[:5] == b"%PDF-":
-            return "pdf"
-        if (b[:8] == b"\x89PNG\r\n\x1a\n" or b[:3] == b"\xff\xd8\xff"
-                or b[:6] in (b"GIF87a", b"GIF89a") or (b[:4] == b"RIFF" and b[8:12] == b"WEBP")
-                or b[:2] == b"BM"):
-            return "image"
+# ---------------------------------------------------------------------------
+# Text sanitization helpers
+# ---------------------------------------------------------------------------
+
+# Marker that the media layer prepends to any threat it detects (e.g. malicious QR code).
+# Downstream stages (preprocess, shield, fuse) look for it via has_security_alert().
+SECURITY_ALERT_MARKER = "[SECURITY ALERT"
+SECURITY_ALERT_RE = re.compile(r"\[\s*SECURITY\s+ALERT\b", re.IGNORECASE)
+
+
+def has_security_alert(text: Any) -> bool:
+    """True if `text` contains a '[SECURITY ALERT ...' tag (also '[SECURITY ALERT - QR THREAT DETECTED]')."""
+    return bool(text) and bool(SECURITY_ALERT_RE.search(str(text)))
+
+
+# Control characters and non-printable code points (tab, LF and CR are kept).
+_CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
+
+# Metadata keys that hold binary blobs. These are always skipped.
+_BINARY_KEYS = {
+    "icc_profile",
+    "exif",
+    "photoshop",
+    "xmp",
+    "iptc",
+    "makernote",
+    "usercomment",
+    "printimatching",
+    "componentsconfiguration",
+    "filesource",
+    "scenetype",
+    "thumbnail",
+    "interoperabilityindex",
+}
+
+# Cap on the length of any single metadata value.
+_MAX_METADATA_VALUE_LEN = 500
+
+_IMAGE_EXTENSIONS = (
+    ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tif", ".tiff", ".webp", ".ico",
+)
+
+
+def _decode_printable(data: bytes) -> Optional[str]:
+    """Decode bytes only if they form clean, printable UTF-8 text; otherwise None."""
+    data = bytes(data).rstrip(b"\x00")
+    if not data:
         return None
-    if isinstance(content, (str, Path)):
-        s = str(content).lower()
-        if len(s) < 500 and "\n" not in s:                 # looks like a path, not pasted text
-            if s.endswith(".pdf"):
-                return "pdf"
-            if s.endswith(_IMAGE_EXT):
-                return "image"
-            if s.endswith(_AUDIO_EXT):
-                return "audio"
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
         return None
-    if hasattr(content, "convert"):                        # PIL image object
-        return "image"
-    return None
+    if not text.strip():
+        return None
+    if _CONTROL_CHARS.search(text) or "\ufffd" in text:
+        return None
+    if not all(ch.isprintable() or ch in "\t\n\r" for ch in text):
+        return None
+    return text
 
 
-def _to_text(value: Any) -> str:
-    """Make EXIF/metadata values readable (they are often bytes, sometimes UTF-16)."""
-    if isinstance(value, bytes):
-        for enc in ("utf-16le", "utf-8"):
-            try:
-                out = value.decode(enc).replace("\x00", "").strip()
-                if out and out.isprintable():
-                    return out
-            except UnicodeDecodeError:
-                continue
-        return value.decode("utf-8", errors="ignore").replace("\x00", "").strip()
-    return str(value).strip()
+def sanitize_text(text: Any) -> str:
+    """Strip control characters / non-printable bytes so no binary junk leaks out.
 
+    Raw bytes are only kept if they decode cleanly to printable UTF-8; otherwise
+    they are dropped entirely (empty string is returned).
+    """
+    if text is None:
+        return ""
+    if isinstance(text, (bytes, bytearray)):
+        decoded = _decode_printable(bytes(text))
+        if decoded is None:
+            return ""
+        text = decoded
+    elif not isinstance(text, str):
+        text = str(text)
+    text = _CONTROL_CHARS.sub("", text)
+    text = text.replace("\ufffd", "")
+    return text.strip()
+
+
+def _is_binary_key(key: Any) -> bool:
+    name = str(key).strip().lower()
+    return name in _BINARY_KEYS or "xmp" in name or "icc" in name
+
+
+def _coerce_value(value: Any) -> Optional[str]:
+    """Convert a metadata value to clean text, or None if it should be dropped."""
+    if isinstance(value, (bytes, bytearray)):
+        text = _decode_printable(bytes(value))
+    elif isinstance(value, str):
+        text = sanitize_text(value)
+    elif isinstance(value, (bool, int, float)):
+        text = str(value)
+    elif isinstance(value, (tuple, list)):
+        parts = [_coerce_value(v) for v in value]
+        # Any binary element poisons the whole value.
+        text = None if any(p is None for p in parts) else ", ".join(parts)  # type: ignore[arg-type]
+    elif isinstance(value, dict):
+        text = None
+    else:
+        # e.g. IFDRational and other numeric-like PIL types
+        text = sanitize_text(str(value))
+
+    if not text:
+        return None
+    text = sanitize_text(text)
+    if not text:
+        return None
+    return text[:_MAX_METADATA_VALUE_LEN]
+
+
+# ---------------------------------------------------------------------------
+# Image helpers
+# ---------------------------------------------------------------------------
 
 def extract_image_metadata(img: Any) -> str:
-    """Extract EXIF and embedded text fields (metadata smuggling)."""
-    chunks = []
+    """Extract textual EXIF / image-info metadata, skipping all binary data."""
+    metadata_chunks: List[str] = []
+
+    # EXIF
     try:
-        exif = img.getexif()                                # public API (was _getexif)
-        for tag_id, value in exif.items():
-            tag = ExifTags.TAGS.get(tag_id, str(tag_id))
-            text = _to_text(value)
-            if len(text) >= 4:
-                chunks.append(f"EXIF {tag}: {text}")
-        for tag_id, value in exif.get_ifd(0x8769).items():  # Exif sub-IFD holds UserComment
-            tag = ExifTags.TAGS.get(tag_id, str(tag_id))
-            text = _to_text(value)
-            if len(text) >= 4:
-                chunks.append(f"EXIF {tag}: {text}")
+        exif = img.getexif() if hasattr(img, "getexif") else None
+        if not exif and hasattr(img, "_getexif"):
+            exif = img._getexif()
+        if exif:
+            for tag_id, value in exif.items():
+                tag = ExifTags.TAGS.get(tag_id, tag_id) if ExifTags else tag_id
+                if _is_binary_key(tag):
+                    continue
+                clean = _coerce_value(value)
+                if clean:
+                    metadata_chunks.append(f"EXIF {sanitize_text(tag)}: {clean}")
     except Exception:
         pass
 
-    info = getattr(img, "info", None)
-    if isinstance(info, dict):
-        for k, v in info.items():
-            if k in _SKIP_INFO_KEYS or not isinstance(v, (str, bytes)):
-                continue                                    # skips ICC profile binary blobs
-            text = _to_text(v)
-            if len(text) >= 4:
-                chunks.append(f"Metadata {k}: {text}")
-    return "\n".join(chunks)
+    # Format-specific info (PNG text chunks, JPEG comments, etc.)
+    try:
+        info = getattr(img, "info", None)
+        if isinstance(info, dict):
+            for k, v in info.items():
+                if _is_binary_key(k):
+                    continue
+                if not isinstance(v, (str, bytes, bytearray)):
+                    continue
+                clean = _coerce_value(v)
+                if clean:
+                    metadata_chunks.append(f"Metadata {sanitize_text(k)}: {clean}")
+    except Exception:
+        pass
+
+    return "\n".join(metadata_chunks)
 
 
 def preprocess_image_for_ocr(img: Any) -> Any:
-    """Grayscale + contrast boost to expose faint / near-invisible text."""
-    return ImageEnhance.Contrast(img.convert("L")).enhance(2.5)
+    gray = img.convert("L")
+    enhancer = ImageEnhance.Contrast(gray)
+    return enhancer.enhance(2.5)
 
 
-def process_image(image_input: Union[str, Path, bytes, Any], enhance_contrast: bool = True) -> Tuple[str, str]:
-    """Returns (ocr_text, metadata_text)."""
+def extract_exif(img: Any) -> str:
+    """Extract EXIF metadata using extract_image_metadata."""
+    return sanitize_text(extract_image_metadata(img))
+
+
+def extract_ocr(img: Any, enhance_contrast: bool = True) -> str:
+    """Extract OCR text using pytesseract with fallback."""
+    if not HAS_TESSERACT:
+        return ""
+    try:
+        processed_img = preprocess_image_for_ocr(img) if enhance_contrast else img
+        return sanitize_text(pytesseract.image_to_string(processed_img))
+    except Exception:
+        return ""
+
+
+def _load_image(image_input: Any) -> Optional[Any]:
+    """Turn bytes / path / PIL image into a loaded PIL image, or None on failure."""
     if not HAS_PIL:
-        raise ImportError("Pillow is required for image processing.")
-    if isinstance(image_input, (str, Path)):
-        img = Image.open(image_input)
-    elif isinstance(image_input, (bytes, bytearray)):
-        img = Image.open(io.BytesIO(bytes(image_input)))
-    elif hasattr(image_input, "convert"):
-        img = image_input
-    else:
-        raise ValueError("Unsupported image input type.")
+        return None
+    try:
+        if isinstance(image_input, Image.Image):
+            return image_input
+        if isinstance(image_input, (bytes, bytearray)):
+            img = Image.open(io.BytesIO(bytes(image_input)))
+        elif isinstance(image_input, (str, Path)):
+            img = Image.open(image_input)
+        else:
+            return None
+        img.load()
+        return img
+    except Exception:
+        return None
 
-    metadata_text = extract_image_metadata(img)
-    proc = preprocess_image_for_ocr(img) if enhance_contrast else img
 
-    ocr_text = ""
-    if HAS_TESSERACT:
-        try:
-            ocr_text = pytesseract.image_to_string(proc)
-        except Exception:
-            ocr_text = ""
-    return ocr_text.strip(), metadata_text.strip()
+def process_image(image_bytes: Union[bytes, Any], enhance_contrast: bool = True) -> Tuple[str, str]:
+    """Extract QR payloads, EXIF metadata and OCR text from an image.
+
+    Accepts raw bytes, a file path, or a PIL Image. Returns a 2-tuple:
+    (ocr_and_qr_text, metadata_text). Undecodable input yields empty strings.
+    """
+    image = _load_image(image_bytes)
+    if image is None:
+        return "", ""
+
+    extracted_parts: List[str] = []
+
+    # 1. Scan QR Codes for Malware & Injections
+    for qr in extract_and_scan_qr_codes(image):
+        payload = sanitize_text(qr["payload"])
+        if payload:
+            extracted_parts.append(f"[QR Content]: {payload}")
+        if qr["is_malicious"]:
+            flags_str = " | ".join(qr["threat_flags"])
+            extracted_parts.append(f"{SECURITY_ALERT_MARKER} - QR THREAT DETECTED]: {flags_str}")
+
+    # 2. Extract EXIF metadata
+    exif_text = extract_exif(image)
+
+    # 3. Perform standard OCR text extraction
+    ocr_text = extract_ocr(image, enhance_contrast)
+    if ocr_text:
+        extracted_parts.append(f"[OCR Text]: {ocr_text}")
+
+    full_ocr_text = sanitize_text("\n".join(extracted_parts))
+    return full_ocr_text, exif_text
 
 
 def process_pdf(pdf_input: Union[str, Path, bytes], min_text_len: int = 20) -> str:
-    """Extract text per page; OCR pages that have no text layer."""
     if not HAS_FITZ:
         raise ImportError("PyMuPDF (pymupdf) is required for PDF processing.")
+
     if isinstance(pdf_input, (str, Path)):
         doc = fitz.open(pdf_input)
-    elif isinstance(pdf_input, (bytes, bytearray)):
-        doc = fitz.open(stream=bytes(pdf_input), filetype="pdf")
+    elif isinstance(pdf_input, bytes):
+        doc = fitz.open(stream=pdf_input, filetype="pdf")
     else:
         raise ValueError("Unsupported PDF input type.")
 
-    pages = []
-    for n, page in enumerate(doc, start=1):
-        text = page.get_text().strip()
-        if len(text) < min_text_len and HAS_PIL:
-            pix = page.get_pixmap(dpi=150)
-            img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-            ocr, _ = process_image(img)
-            combined = f"{text}\n{ocr}".strip()
-            if combined:
-                pages.append(f"--- Page {n} (Scanned OCR) ---\n{combined}")
+    extracted_pages = []
+
+    for page_num, page in enumerate(doc):
+        page_text = sanitize_text(page.get_text())
+
+        if len(page_text) < min_text_len and HAS_PIL:
+            try:
+                pix = page.get_pixmap(dpi=150)
+                img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                ocr_txt, meta_txt = process_image(img)
+                image_text = f"{ocr_txt}\n{meta_txt}".strip()
+                combined = f"{page_text}\n{image_text}".strip()
+            except Exception:
+                combined = page_text
+
+            content = combined if combined else page_text
+            extracted_pages.append(f"--- Page {page_num + 1} ---\n{content}".strip())
         else:
-            pages.append(f"--- Page {n} ---\n{text}")
+            extracted_pages.append(f"--- Page {page_num + 1} ---\n{page_text}".strip())
+
     doc.close()
-    return "\n\n".join(pages)
+    return "\n\n".join(extracted_pages).strip()
 
 
 def process_audio(audio_path: Union[str, Path], model_name: str = "base") -> str:
     if not HAS_WHISPER:
         raise ImportError("openai-whisper is required for audio transcription.")
+
     model = whisper.load_model(model_name)
-    return model.transcribe(str(audio_path)).get("text", "").strip()
+    result = model.transcribe(str(audio_path))
+    return sanitize_text(result.get("text", ""))
+
+
+def _looks_like_image_input(content: Any) -> bool:
+    if isinstance(content, (bytes, bytearray)):
+        return True
+    if HAS_PIL and isinstance(content, Image.Image):
+        return True
+    if isinstance(content, (str, Path)):
+        return str(content).lower().endswith(_IMAGE_EXTENSIONS)
+    return False
 
 
 def ingest_media(content: Any, media_type: str = "auto") -> Tuple[str, str]:
-    """Normalise any input to (text, modality_label). Empty text is a valid result."""
-    if media_type == "auto":
-        media_type = _sniff(content) or "text"
+    if isinstance(content, (str, Path)) and str(content).lower().endswith(".pdf"):
+        media_type = "pdf"
 
     if media_type == "pdf":
         return process_pdf(content), "pdf_document"
-    if media_type == "audio":
+
+    if media_type == "audio" or (isinstance(content, (str, Path)) and str(content).lower().endswith((".mp3", ".wav", ".m4a"))):
         return process_audio(content), "audio_transcript"
-    if media_type == "image":
-        ocr, meta = process_image(content)
-        parts = [ocr] + ([f"[Image metadata]\n{meta}"] if meta else [])
-        return "\n\n".join(p for p in parts if p).strip(), "image_ocr"
-    return str(content), "user_input"
+
+    if media_type == "image" or (media_type == "auto" and _looks_like_image_input(content)):
+        if _load_image(content) is not None:
+            ocr_txt, meta_txt = process_image(content)
+            parts = [p for p in (ocr_txt, meta_txt) if p]
+            return "\n".join(parts), "image_ocr"
+
+    # Fallback: treat as plain user input, never emitting raw binary.
+    return sanitize_text(content), "user_input"
 
 
 class MediaProcessor:
-    """Class interface for preprocess.py and other shield modules."""
+    def __init__(self) -> None:
+        pass
 
     @classmethod
     def ingest(cls, content: Any, media_type: str = "auto") -> Tuple[str, str]:
         return ingest_media(content, media_type)
 
-    process = ingest
+    @classmethod
+    def process(cls, content: Any, media_type: str = "auto") -> Tuple[str, str]:
+        return ingest_media(content, media_type)
 
     @classmethod
-    def process_image(cls, image_input, enhance_contrast: bool = True):
-        return process_image(image_input, enhance_contrast)
+    def process_image(cls, image_input: Union[str, Path, bytes, Any], enhance_contrast: bool = True) -> Tuple[str, str]:
+        ocr_txt, meta_txt = process_image(image_input, enhance_contrast)
+        parts = [p for p in (ocr_txt, meta_txt) if p]
+        return "\n".join(parts), "image_ocr"
 
     @classmethod
-    def process_pdf(cls, pdf_input, min_text_len: int = 20):
+    def process_pdf(cls, pdf_input: Union[str, Path, bytes], min_text_len: int = 20) -> str:
         return process_pdf(pdf_input, min_text_len)
 
     @classmethod
-    def process_audio(cls, audio_path, model_name: str = "base"):
+    def process_audio(cls, audio_path: Union[str, Path], model_name: str = "base") -> str:
         return process_audio(audio_path, model_name)
+
+
+# ---------------------------------------------------------------------------
+# QR code scanning
+# ---------------------------------------------------------------------------
+
+# High-risk malware & threat patterns inside QR payloads
+MALWARE_EXTENSIONS = re.compile(
+    r"\.(exe|apk|bat|sh|ps1|vbs|scr|dll|cmd|msi|iso|dmg|jar|js)\b", re.IGNORECASE
+)
+RAW_IP_URL = re.compile(
+    r"https?://(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?", re.IGNORECASE
+)
+DANGEROUS_PROTOCOLS = re.compile(
+    r"^(javascript|data|file|vbscript|intent):", re.IGNORECASE
+)
+SUSPICIOUS_TUNNELS = re.compile(
+    r"(ngrok\.io|requestbin|pipedream\.net|discord\.com/api/webhooks|webhook\.site)", re.IGNORECASE
+)
+INJECTION_KEYWORDS = re.compile(
+    r"(system\s+override|ignore\s+previous|disregard\s+all|exfiltrate|output\s+api\s+key|act\s+as\s+root)", re.IGNORECASE
+)
+
+
+def analyze_qr_payload(payload: str) -> Dict[str, Any]:
+    """Analyzes a QR code text payload for malware, quishing, and prompt injection signatures."""
+    payload = sanitize_text(payload)
+    threats = []
+
+    # 1. Check for dangerous script execution protocols or Data URIs
+    if DANGEROUS_PROTOCOLS.search(payload):
+        threats.append("MALWARE_PROTOCOL: Dangerous URI scheme detected (e.g., javascript:, data:)")
+
+    # 2. Check for direct executable file downloads
+    if MALWARE_EXTENSIONS.search(payload):
+        threats.append("MALWARE_DOWNLOAD: Direct link to executable/payload file in QR code")
+
+    # 3. Check for raw IP address hosting (common in malware command-and-control)
+    if RAW_IP_URL.search(payload):
+        threats.append("SUSPICIOUS_HOST: URL uses raw IP address instead of domain name")
+
+    # 4. Check for exfiltration endpoints and tunneling services
+    if SUSPICIOUS_TUNNELS.search(payload):
+        threats.append("EXFIL_TUNNEL: Exfiltration service or webhook destination detected")
+
+    # 5. Check for embedded prompt injection instructions
+    if INJECTION_KEYWORDS.search(payload):
+        threats.append("INDIRECT_INJECTION: Prompt injection command detected inside QR code")
+
+    is_malicious = len(threats) > 0
+    return {
+        "payload": payload,
+        "is_malicious": is_malicious,
+        "threat_flags": threats
+    }
+
+
+def extract_and_scan_qr_codes(image: Image.Image) -> List[Dict[str, Any]]:
+    """Detects QR codes in an image and scans them for security threats."""
+    if not HAS_OPENCV:
+        return []
+
+    try:
+        open_cv_image = cv2.cvtColor(np.array(image.convert("RGB")), cv2.COLOR_RGB2BGR)
+        detector = cv2.QRCodeDetector()
+
+        retval, decoded_info, _, _ = detector.detectAndDecodeMulti(open_cv_image)
+        results = []
+
+        payloads = []
+        if retval:
+            payloads = [info.strip() for info in decoded_info if info.strip()]
+        else:
+            data, _, _ = detector.detectAndDecode(open_cv_image)
+            if data and data.strip():
+                payloads.append(data.strip())
+
+        for p in payloads:
+            if not sanitize_text(p):
+                continue
+            results.append(analyze_qr_payload(p))
+
+        return results
+    except Exception:
+        return []
