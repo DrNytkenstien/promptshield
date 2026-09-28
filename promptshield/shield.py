@@ -21,15 +21,28 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-from promptshield.media import ingest_media
 from . import fuse
 from .audit import AuditLog
 from .config import POLICY_DIR
 from .gate import ActionGate, Policy
-from .preprocess import preprocess
+from .media import ingest_media
+from .preprocess import preprocess, qr_rules_score
 from .signals import classifier, heuristics, judge, similarity
 from .taint import SessionTaint, extract_values
-from .types import Finding, GateDecision, ScanResult
+from .types import Finding, GateDecision, ScanResult, SignalScore
+
+
+def _rules_score(chunk) -> SignalScore:
+    """The 'heuristics' (rules) feature for one chunk: text rules plus the continuous QR/media rule score.
+
+    Same signal name as before, so the fusion feature schema is unchanged. Nothing here decides
+    allow/warn/quarantine; fuse.py does that from the signal values.
+    """
+    base = heuristics.score_chunk(chunk)
+    qr, reasons = qr_rules_score(chunk.text)
+    if qr > base.score:
+        return SignalScore(name="heuristics", score=qr, reasons=list(base.reasons) + reasons)
+    return base
 
 
 class ActionHeld(Exception):
@@ -76,8 +89,9 @@ class Shield:
         t0 = time.perf_counter()
 
         # Media Normalization: Extract text signals from Images, PDFs, and Audio
-        if source in ["image", "pdf", "audio"] or isinstance(content, (Path, bytes)):
-            content, source = ingest_media(content, media_type=source)
+        if source in ("image", "pdf", "audio") or isinstance(content, (Path, bytes, bytearray)):
+            media_type = source if source in ("image", "pdf", "audio") else "auto"
+            content, source = ingest_media(content, media_type=media_type)
 
         pre = preprocess(content)
         chunks = pre.chunks
@@ -86,7 +100,7 @@ class Shield:
         if chunks:
             if self.use["heuristics"]:
                 for i, c in enumerate(chunks):
-                    per_chunk[i].append(heuristics.score_chunk(c))
+                    per_chunk[i].append(_rules_score(c))
             if self.use["similarity"]:
                 for i, s in enumerate(similarity.score_chunks(chunks)):
                     per_chunk[i].append(s)

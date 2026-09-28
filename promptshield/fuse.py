@@ -5,12 +5,14 @@ Per chunk:
      Signals that are unavailable are skipped and the other weights re-balanced.
      If train/train_fusion.py has produced runtime/fusion_weights.json AND the same
      signals are available now, the learned logistic-regression model is used instead.
-  2. A single very strong signal is not averaged away (strong_signal_floor).
+  2. (Removed) There is no strong-signal floor: the score is purely the weighted/learned combination.
   3. If the score is in the unclear band, the LLM judge is asked and can move it partway.
 
 Per document:
   risk = highest chunk score (an email is as dangerous as its worst sentence),
   raised to a minimum if the pre-processor found hiding tricks.
+  Media/QR threats get no special case: the rules signal carries them (see preprocess.qr_rules_score)
+  and the fused score is whatever the learned weights (or the default weights) make of it.
 """
 from __future__ import annotations
 
@@ -63,9 +65,8 @@ def fast_score(signals: list[SignalScore], use_learned: bool = True) -> float:
         total_w = sum(SETTINGS.weights[n] for n in by_name)
         score = sum(SETTINGS.weights[n] * by_name[n].score for n in by_name) / total_w
 
-    strongest = max(s.score for s in by_name.values())
-    if strongest >= SETTINGS.strong_signal_floor:
-        score = max(score, strongest * 0.8)
+    # No floors, caps or buckets: the score is exactly the weighted / learned combination above.
+    # min/max only guard the 0-1 range against floating-point or extrapolation noise.
     return min(1.0, max(0.0, score))
 
 
@@ -122,7 +123,7 @@ def explain(level: Level, risk: int, top: Optional[ChunkResult], findings: list[
                     reasons.append(r)
         if reasons:
             parts.append("Why: " + "; ".join(reasons[:4]) + ".")
-    tricks = sorted({f.detail for f in findings if f.kind in FINDING_FLOORS or f.kind == "attribute_text"})
+    tricks = sorted({f.detail for f in findings if f.kind in FINDING_FLOORS or f.kind in ("attribute_text", "media_alert")})
     if tricks:
         parts.append("Hiding tricks found: " + "; ".join(tricks[:3]) + ".")
     return " ".join(parts)

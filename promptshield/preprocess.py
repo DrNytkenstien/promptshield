@@ -13,9 +13,6 @@ Known limitation (say this to judges): we only understand INLINE styles. Text hi
 CSS classes defined in <style> blocks or external stylesheets is treated as visible.
 """
 from __future__ import annotations
-from promptshield.media import MediaProcessor
-from promptshield.media import MediaProcessor
-
 import base64
 import binascii
 import re
@@ -26,6 +23,7 @@ from pathlib import Path
 from bs4 import BeautifulSoup, Comment
 
 from .config import SETTINGS
+from .media import has_security_alert, ingest_media
 from .types import Chunk, Finding
 
 # ---------------------------------------------------------------- unicode tricks
@@ -54,6 +52,43 @@ _MD_IMAGE = re.compile(r"!\[[^\]]*\]\((https?://[^)\s]+)\)")
 _SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+|\n{2,}")
 
 
+# ---------------------------------------------------------------- QR / media threat feature
+# Severity (0-1) of each rule that media.analyze_qr_payload can raise. These are FEATURE weights:
+# they describe how strong one rule match is as evidence. They are not decisions. The decision comes
+# only from fuse.py (learned logistic model or the weighted average of the three signals).
+QR_RULE_SEVERITY = {
+    "MALWARE_PROTOCOL": 0.90,     # javascript:, data:, file: ... URIs
+    "MALWARE_DOWNLOAD": 0.85,     # direct link to an executable / payload
+    "EXFIL_TUNNEL": 0.85,         # webhook / tunnel / request-bin destination
+    "INDIRECT_INJECTION": 0.80,   # prompt-injection phrase inside the QR payload
+    "SUSPICIOUS_HOST": 0.60,      # raw-IP URL
+}
+QR_GENERIC_ALERT_SEVERITY = 0.50  # '[SECURITY ALERT' tag with no recognised rule code
+_QR_RULE_CODE = re.compile(r"\b(" + "|".join(QR_RULE_SEVERITY) + r")\b")
+
+
+def qr_rules_score(text: str) -> tuple[float, list[str]]:
+    """Continuous 0.0-1.0 rules feature for media/QR threat matches in `text`.
+
+    Each distinct rule match contributes its severity; matches are combined with a noisy-OR,
+    1 - prod(1 - severity), so more matches and more severe matches both push the score up,
+    it never exceeds 1.0, and a single weak match stays well below a strong one.
+    Returns (score, human-readable reasons). No match -> (0.0, []).
+    """
+    codes = list(dict.fromkeys(_QR_RULE_CODE.findall(text)))       # distinct, in order
+    severities = [QR_RULE_SEVERITY[c] for c in codes]
+    reasons = [f"QR rule matched: {c}" for c in codes]
+    if not severities and has_security_alert(text):
+        severities = [QR_GENERIC_ALERT_SEVERITY]
+        reasons = ["Media scan raised a security alert"]
+    if not severities:
+        return 0.0, []
+    miss = 1.0
+    for s in severities:
+        miss *= (1.0 - s)
+    return round(1.0 - miss, 4), reasons
+
+
 @dataclass
 class Preprocessed:
     visible_text: str
@@ -63,25 +98,15 @@ class Preprocessed:
 
 
 # ================================================================= public entry point
-media_processor = MediaProcessor()
 def preprocess(content: str | bytes | Path, modality: str = "auto") -> Preprocessed:
     """Clean `content` (HTML, plain text, or media files) and split it into scoreable chunks."""
     findings: list[Finding] = []
     hidden: list[str] = []
 
-    # 2. Add media extraction block here (before HTML parsing)
-    if isinstance(content, (bytes, Path)) or modality != "auto":
-        media_res = media_processor.process(content, modality=modality)
-        content = media_res["text"]
-        if media_res.get("metadata_text"):
-            hidden.append(media_res["metadata_text"])
-            findings.append(
-                Finding(
-                    kind="media_metadata",
-                    detail=f"Extracted EXIF/metadata from {media_res['modality']}",
-                    text=media_res["metadata_text"],
-                )
-            )
+    # Media extraction (images / PDFs / audio) before HTML parsing.
+    # ingest_media returns (clean_text, source_label) and never emits raw binary.
+    if isinstance(content, (bytes, bytearray, Path)) or modality != "auto":
+        content, _ = ingest_media(content, media_type=modality)
 
     if _looks_like_html(content):
         visible, html_hidden, html_findings = _split_html(content)
@@ -101,6 +126,15 @@ def preprocess(content: str | bytes | Path, modality: str = "auto") -> Preproces
         cleaned_hidden.extend(extra_hidden)
         findings.extend(extra_findings)
     hidden = [h for h in cleaned_hidden if h.strip()]
+
+    # Media-layer threat tags (e.g. malicious QR code): informational finding only.
+    # The score comes from qr_rules_score() -> heuristics signal -> fuse.py, never from a hardcoded value.
+    alert_scope = visible + "\n" + "\n".join(hidden)
+    if has_security_alert(alert_scope):
+        alert_line = next((ln for ln in alert_scope.splitlines() if has_security_alert(ln)), "[SECURITY ALERT")
+        findings.append(Finding(kind="media_alert",
+                                detail="Media scan flagged a security threat (e.g. malicious QR code)",
+                                text=alert_line.strip()))
 
     # Encoded payloads and exfiltration links
     b64_hidden, b64_findings = _decode_base64(visible + "\n" + "\n".join(hidden))

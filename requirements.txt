@@ -18,3 +18,5 @@ pymupdf>=1.23.0
 pillow
 pytesseract
 openai-whisper
+
+opencv-python-headless
