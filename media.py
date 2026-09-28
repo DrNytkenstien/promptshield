@@ -283,8 +283,8 @@ def process_image(image_bytes: Union[bytes, Any], enhance_contrast: bool = True)
     if ocr_text:
         extracted_parts.append(f"[OCR Text]: {ocr_text}")
 
-    full_ocr_text = sanitize_text("\n".join(extracted_parts))
-    return full_ocr_text, exif_text
+    ocr_and_qr_text = sanitize_text("\n".join(extracted_parts))
+    return ocr_and_qr_text, exif_text
 
 
 def process_pdf(pdf_input: Union[str, Path, bytes], min_text_len: int = 20) -> str:
@@ -308,7 +308,8 @@ def process_pdf(pdf_input: Union[str, Path, bytes], min_text_len: int = 20) -> s
                 pix = page.get_pixmap(dpi=150)
                 img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
                 ocr_txt, meta_txt = process_image(img)
-                image_text = f"{ocr_txt}\n{meta_txt}".strip()
+                parts = [p for p in (ocr_txt, meta_txt) if p]
+                image_text = "\n".join(parts)
                 combined = f"{page_text}\n{image_text}".strip()
             except Exception:
                 combined = page_text
