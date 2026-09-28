@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import io
 import re
@@ -441,7 +441,7 @@ def analyze_qr_payload(payload: str) -> Dict[str, Any]:
     }
 
 
-def extract_and_scan_qr_codes(image: Image.Image) -> List[Dict[str, Any]]:
+def extract_and_scan_qr_codes(image: Any) -> List[Dict[str, Any]]:
     """Detects QR codes in an image and scans them for security threats."""
     if not HAS_OPENCV:
         return []

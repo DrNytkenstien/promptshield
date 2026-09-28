@@ -53,8 +53,11 @@ def test_exif_metadata_smuggling():
     buf = io.BytesIO()
     img.save(buf, format="JPEG", exif=exif)
 
-    ocr_text, metadata_text = process_image(buf.getvalue())
-    assert "Malicious instruction" in metadata_text or ocr_text is not None
+    # process_image() returns a single tagged string: [QR Content] / [EXIF Metadata] / [OCR Text]
+    result = process_image(buf.getvalue())
+    assert isinstance(result, str)
+    assert "[EXIF Metadata]" in result
+    assert "Malicious instruction" in result
 
 
 def test_ingest_media_routing():
